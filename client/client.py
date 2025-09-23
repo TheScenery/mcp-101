@@ -47,8 +47,11 @@ class MCPClient:
         tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools])
 
-    async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
+    async def process_query(self, query: str) -> None:
+        """Process a query using Claude and available tools, streaming the output."""
+        from collections import defaultdict
+        import json
+
         messages = [
             {
                 "role": "user",
@@ -63,57 +66,102 @@ class MCPClient:
             "input_schema": tool.inputSchema
         } for tool in response.tools]
 
-        # Initial Claude API call
-        response = self.anthropic.messages.create(
+        # Initial Claude API call with streaming
+        response_stream = self.anthropic.messages.create(
             model="deepseek-chat",
-            max_tokens=1000,
+            max_tokens=1024,
             messages=messages,
-            tools=available_tools
+            tools=available_tools,
+            stream=True
         )
 
-        # Process response and handle tool calls
-        final_text = []
-
         assistant_message_content = []
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-                assistant_message_content.append(content)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
+        text_parts = []
+        tool_calls = []
+        
+        # State-based parsing for the stream
+        current_tool_call = None
 
-                # Execute tool call
+        for chunk in response_stream:
+            # print(chunk) # Uncomment for debugging the raw stream
+            if chunk.type == 'content_block_start':
+                if chunk.content_block.type == 'tool_use':
+                    current_tool_call = {
+                        "type": "tool_use",
+                        "id": chunk.content_block.id,
+                        "name": chunk.content_block.name,
+                        "input": ""
+                    }
+            elif chunk.type == 'content_block_delta':
+                delta = chunk.delta
+                if delta.type == 'text_delta':
+                    text_part = delta.text
+                    print(text_part, end="", flush=True)
+                    text_parts.append(text_part)
+                elif delta.type == 'input_json_delta':
+                    if current_tool_call:
+                        current_tool_call["input"] += delta.partial_json
+            elif chunk.type == 'content_block_stop':
+                if current_tool_call:
+                    # The input is a JSON string, so we parse it
+                    try:
+                        current_tool_call["input"] = json.loads(current_tool_call["input"])
+                        tool_calls.append(current_tool_call)
+                    except json.JSONDecodeError:
+                        print(f"\nError: Could not decode JSON for tool input: {current_tool_call['input']}")
+                    current_tool_call = None
+
+        # After the stream, construct the full message content
+        if text_parts:
+            assistant_message_content.append({"type": "text", "text": "".join(text_parts)})
+        if tool_calls:
+            assistant_message_content.extend(tool_calls)
+
+        if not assistant_message_content:
+            return  # No response from assistant
+
+        messages.append({
+            "role": "assistant",
+            "content": assistant_message_content
+        })
+
+        # If there are tool calls, execute them and send results back
+        if tool_calls:
+            tool_results = []
+            for tool_call in tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["input"]
+                
+                print(f"\n[Calling tool {tool_name} with args {tool_args}]", flush=True)
                 result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                assistant_message_content.append(content)
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_message_content
-                })
-                messages.append({
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": content.id,
-                            "content": result.content
-                        }
-                    ]
+                
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call["id"],
+                    "content": result.content
                 })
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="deepseek-chat",
-                    max_tokens=1000,
-                    messages=messages,
-                    tools=available_tools
-                )
+            messages.append({
+                "role": "user",
+                "content": tool_results
+            })
 
-                final_text.append(response.content[0].text)
+            # Get next response from Claude (streaming for the tool result)
+            response_stream = self.anthropic.messages.create(
+                model="deepseek-chat",
+                max_tokens=1024,
+                messages=messages,
+                tools=available_tools,
+                stream=True
+            )
 
-        return "\n".join(final_text)
+            print()  # Newline after tool call message
+            for chunk in response_stream:
+                if chunk.type == 'content_block_delta' and chunk.delta.type == 'text_delta':
+                    text_delta = chunk.delta.text
+                    print(text_delta, end='', flush=True)
+            
+            print()  # Final newline for clean formatting
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
@@ -127,8 +175,7 @@ class MCPClient:
                 if query.lower() == 'quit':
                     break
 
-                response = await self.process_query(query)
-                print("\n" + response)
+                await self.process_query(query)
 
             except Exception as e:
                 print(f"\nError: {str(e)}")
